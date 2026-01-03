@@ -964,74 +964,13 @@ run_server(void *data) {
     // exist, and scrcpy will execute "adb connect").
     bool need_initial_serial = !params->tcpip_dst;
 
-    if (need_initial_serial) {
-        // At most one of the 3 following parameters may be set
-        assert(!!params->req_serial
-               + params->select_usb
-               + params->select_tcpip <= 1);
-
-        struct sc_adb_device_selector selector;
-        if (params->req_serial) {
-            selector.type = SC_ADB_DEVICE_SELECT_SERIAL;
-            selector.serial = params->req_serial;
-        } else if (params->select_usb) {
-            selector.type = SC_ADB_DEVICE_SELECT_USB;
-        } else if (params->select_tcpip) {
-            selector.type = SC_ADB_DEVICE_SELECT_TCPIP;
-        } else {
-            // No explicit selection, check $ANDROID_SERIAL
-            const char *env_serial = getenv("ANDROID_SERIAL");
-            if (env_serial) {
-                LOGI("Using ANDROID_SERIAL: %s", env_serial);
-                selector.type = SC_ADB_DEVICE_SELECT_SERIAL;
-                selector.serial = env_serial;
-            } else {
-                selector.type = SC_ADB_DEVICE_SELECT_ALL;
-            }
-        }
-        struct sc_adb_device device;
-        ok = sc_adb_select_device(&server->intr, &selector, 0, &device);
-        if (!ok) {
-            goto error_connection_failed;
-        }
-
-        if (params->tcpip) {
-            assert(!params->tcpip_dst);
-            ok = sc_server_configure_tcpip_unknown_address(server,
-                                                           device.serial);
-            sc_adb_device_destroy(&device);
-            if (!ok) {
-                goto error_connection_failed;
-            }
-            assert(server->serial);
-        } else {
-            // "move" the device.serial without copy
-            server->serial = device.serial;
-            // the serial must not be freed by the destructor
-            device.serial = NULL;
-            sc_adb_device_destroy(&device);
-        }
-    } else {
-        // If the user passed a '+' (--tcpip=+ip), then disconnect first
-        const char *tcpip_dst = params->tcpip_dst;
-        bool plus = tcpip_dst[0] == '+';
-        if (plus) {
-            ++tcpip_dst;
-        }
-        ok = sc_server_configure_tcpip_known_address(server, tcpip_dst, plus);
-        if (!ok) {
-            goto error_connection_failed;
-        }
-    }
+    server->serial = params->req_serial;
 
     const char *serial = server->serial;
     assert(serial);
     LOGD("Device serial: %s", serial);
 
-    ok = push_server(&server->intr, serial);
-    if (!ok) {
-        goto error_connection_failed;
-    }
+    ok = true;
 
     // If --list-* is passed, then the server just prints the requested data
     // then exits.
@@ -1056,41 +995,19 @@ run_server(void *data) {
     assert(r == sizeof(SC_SOCKET_NAME_PREFIX) - 1 + 8);
     assert(server->device_socket_name);
 
-    ok = sc_adb_tunnel_open(&server->tunnel, &server->intr, serial,
-                            server->device_socket_name, params->port_range,
-                            params->force_adb_forward);
-    if (!ok) {
-        goto error_connection_failed;
-    }
+    server->tunnel.forward = true;
+    server->tunnel.enabled = true;
 
     // server will connect to our server socket
-    sc_pid pid = execute_server(server, params);
-    if (pid == SC_PROCESS_NONE) {
-        sc_adb_tunnel_close(&server->tunnel, &server->intr, serial,
-                            server->device_socket_name);
-        goto error_connection_failed;
-    }
+    sc_pid pid = SC_PROCESS_NONE;
 
     static const struct sc_process_listener listener = {
         .on_terminated = sc_server_on_terminated,
     };
-    struct sc_process_observer observer;
-    ok = sc_process_observer_init(&observer, pid, &listener, server);
-    if (!ok) {
-        sc_process_terminate(pid);
-        sc_process_wait(pid, true); // ignore exit code
-        sc_adb_tunnel_close(&server->tunnel, &server->intr, serial,
-                            server->device_socket_name);
-        goto error_connection_failed;
-    }
 
     ok = sc_server_connect_to(server, &server->info);
     // The tunnel is always closed by server_connect_to()
     if (!ok) {
-        sc_process_terminate(pid);
-        sc_process_wait(pid, true); // ignore exit code
-        sc_process_observer_join(&observer);
-        sc_process_observer_destroy(&observer);
         goto error_connection_failed;
     }
 
@@ -1122,28 +1039,7 @@ run_server(void *data) {
     }
 
     // Give some delay for the server to terminate properly
-#define WATCHDOG_DELAY SC_TICK_FROM_SEC(1)
-    sc_tick deadline = sc_tick_now() + WATCHDOG_DELAY;
-    bool terminated = sc_process_observer_timedwait(&observer, deadline);
-
-    // After this delay, kill the server if it's not dead already.
-    // On some devices, closing the sockets is not sufficient to wake up the
-    // blocking calls while the device is asleep.
-    if (!terminated) {
-        // The process may have terminated since the check, but it is not
-        // reaped (closed) yet, so its PID is still valid, and it is ok to call
-        // sc_process_terminate() even in that case.
-        LOGW("Killing the server...");
-        sc_process_terminate(pid);
-    }
-
-    sc_process_observer_join(&observer);
-    sc_process_observer_destroy(&observer);
-
-    sc_process_close(pid);
-
     sc_server_kill_adb_if_requested(server);
-
     return 0;
 
 error_connection_failed:
